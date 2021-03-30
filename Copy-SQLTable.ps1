@@ -1,4 +1,3 @@
-https://corningjobs.corning.com/job/Charlotte-IT-Solutions-Architect%2C-Advanced-Analytics-NC-28216/693335800/
 <#
 #######################
 #
@@ -119,19 +118,33 @@ https://corningjobs.corning.com/job/Charlotte-IT-Solutions-Architect%2C-Advanced
             -BulkCopyTimeout $bulkCopyTimeout `
             -Verbose
  
+.EXAMPLE
+ 
+    #Copies constraints and recreates target table if it already exists
+    #....allows watching row-counts in Verbose output
+ 
+    Copy-SQLTable `
+        -SourceInstance '(local)' `
+        -SourceDB 'DataStudio4' `
+        -DestInstance '(local)' `
+        -DestDB Test  `
+        -Tables @('dbo.QueryText') `
+        -CopyConstraints: $true `
+        -DropIfTargetTableExists: $true `
+        -BulkCopyBatchSize 1000 `
+        -Verbose
+  
 .NOTES
- 
-    
- 
+  
 Version History
     v1.0  - Jun 12, 2017. Jana Sattainathan [Twitter: @SQLJana] [Blog: sqljana.wordpress.com]
-    v1.1  - Mar 09, 2021. Jana Sattainathan  - Accounted for square brackets, dots in table names, get target row count, return object with status and more error handling
+    v1.1  - Mar 09, 2021. Jana Sattainathan - Accounted for square brackets, dots in table names, get target row count, return object with status and more error handling
+    v1.2  - Mar 30, 2021. Jana Sattainathan - Added support for row count progress output via progress bar and verbose output.
  
 .LINK
     sqljana.wordpress.com
 #
 #>
- 
  
 function Copy-SQLTable
 {
@@ -155,6 +168,9 @@ function Copy-SQLTable
  
         [Parameter(Mandatory=$false)]
         [switch] $DropIfTargetTableExists = $false,
+ 
+        [Parameter(Mandatory=$false)]
+        [switch] $CopyConstraints = $true,
  
         [Parameter(Mandatory=$false)]
         [switch] $CopyIndexes = $true,       
@@ -210,7 +226,7 @@ function Copy-SQLTable
     Write-Verbose $stepName
  
     #BEGIN: For RowCount
-    #https://blog.netnerds.net/2015/05/getting-total-number-of-rows-copied-in-sqlbulkcopy-using-powershell/
+    #Source: https://blog.netnerds.net/2015/05/getting-total-number-of-rows-copied-in-sqlbulkcopy-using-powershell/
     # Thanks user601543 @ http://stackoverflow.com/questions/1188384/sqlbulkcopy-row-count-when-complete   
     $source = 'namespace System.Data.SqlClient
     {   
@@ -397,7 +413,7 @@ function Copy-SQLTable
                 }
                 else
                 {
-                    $sourceRowCount = $table.RowCount                   
+                    $sourceRowCount = $table.RowCount                  
                     $sourceIndexCount = $table.Indexes.Count
                     $sourceDataSize = $table.DataSpaceUsed
                     $sourceIndexSize = $table.IndexSpaceUsed
@@ -481,7 +497,7 @@ function Copy-SQLTable
  
                     if ($DropIfTargetTableExists -eq $true)
                     {
-                        Write-Verbose "[$fn]: Drop table $tableAndSchema in target if it exists"
+                        $stepName = "[$fn]: Drop table $tableAndSchema in target if it exists"
                         #---------------------------------------------------------------
                         Write-Verbose $stepName
  
@@ -500,16 +516,47 @@ function Copy-SQLTable
                     #Create table only if asked to or if table is missing in Dest. Otherwise, the user may want to append to existing table
                     if (($DropIfTargetTableExists -eq $true) -or ($tableExistsInDest -eq $false))
                     {
+ 
+                        $stepName = "[$fn]: Scripting default scripting options - default"
+                        #----------------------------
+                        $scriptingCreateOptions = New-Object Microsoft.SqlServer.Management.Smo.ScriptingOptions
+                        Write-Verbose $stepName
+
+                        $scriptingCreateOptions.ExtendedProperties = $true; # Script Extended Properties
+
+                        #$scriptingCreateOptions.DriAllConstraints = $true   # to include referential constraints in the script
+                        #$scriptingCreateOptions.NoCollation = $false; # Use default collation
+                        #$scriptingCreateOptions.SchemaQualify = $true; # Qualify objects with schema names
+                        #$scriptingCreateOptions.ScriptSchema = $true; # Script schema
+                        #$scriptingCreateOptions.IncludeDatabaseContext = $true;
+                        #$scriptingCreateOptions.EnforceScriptingOptions = $true;
+                        #$scriptingCreateOptions.Indexes= $true # Yup, these would be nice
+                        #$scriptingCreateOptions.Triggers= $true # This should be included when scripting a database               
+ 
+                        $stepName = "[$fn]: Create constraints"
+                        #---------------------------------------------------------------
+                        Write-Verbose $stepName
+
+                        #Copy constraints
+                        if ($CopyConstraints -eq $true)
+                        {
+                            $scriptingCreateOptions.DRIAll= $true     #All the constraints (check/PK/FK..)
+                        }
+                        else
+                        {
+                            $scriptingCreateOptions.DRIAll= $false
+                        }
+
                         $stepName = "[$fn]: Get the source table script for $tableAndSchema and create in target"
                         #---------------------------------------------------------------
                         Write-Verbose $stepName
  
-                        $Tablescript = ($table.Script() | Out-String)
- 
+                        $tablescript = ($table.Script($scriptingCreateOptions) | Out-String)
+                       
                         Invoke-Sqlcmd `
                                     -ServerInstance $DestInstance `
                                     -Database $DestDB `
-                                    -Query $Tablescript
+                                    -Query $tablescript
                     }
  
  
@@ -533,8 +580,14 @@ function Copy-SQLTable
                         $bulkCopy = New-Object Data.SqlClient.SqlBulkCopy($destConnString, [System.Data.SqlClient.SqlBulkCopyOptions]::KeepIdentity)
                         $bulkCopy.DestinationTableName = $tableAndSchema
                         $bulkCopy.BulkCopyTimeOut = $BulkCopyTimeout
-                        $bulkCopy.BatchSize = $BulkCopyBatchSize
-                        $bulkCopy.Add_SqlRowscopied({Write-Verbose "$($args[1].RowsCopied) rows copied" })
+                       $bulkCopy.BatchSize = $BulkCopyBatchSize
+                        $bulkCopy.NotifyAfter = $BulkCopyBatchSize
+                        $bulkCopy.Add_SqlRowscopied({Write-Verbose "$($args[1].RowsCopied) rows copied" ;
+                                                     Write-Progress -Activity "Copying data:" `
+                                                            -PercentComplete ([int](100 * $args[1].RowsCopied / $returnObj.SourceRowCount)) `
+                                                            -CurrentOperation ("Completed {0}% of the rows" -f ([int](100 * $args[1].RowsCopied / $returnObj.SourceRowCount))) `
+                                                            -Status ("Table: [{0}]" -f $tableAndSchema) `
+                                                            -Id 2})
                         $bulkCopy.WriteToServer($sqlReader)
                         $sqlReader.Close()
                         $bulkCopy.Close()
@@ -620,7 +673,7 @@ function Copy-SQLTable
             {
                 [Exception]$ex = $_.Exception
                 $err = "Unable to copy table: {0}. Error in step: `"{1}]`" `n{2}" -f `
-                           $tableAndSchema, $stepName, $ex.Message
+                            $tableAndSchema, $stepName, $ex.Message
  
                
                 $stepName = "[$fn]: Update status information"
@@ -640,7 +693,7 @@ function Copy-SQLTable
                 $returnObj.Duration = $Duration
                 $returnObj.Status = 'EXCEPTION'
                 $returnObj.StatusMessage = $err
-           }
+            }
  
  
             #Return object for caller
@@ -666,4 +719,4 @@ function Copy-SQLTable
     {
         #Return value if any
     }
-}   
+}  
